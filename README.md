@@ -20,6 +20,6 @@ python main.py --user '...' --password '...' --date 2026-11-30 --venue '学生�
 python main.py --user '...' --password '...' --date 2026-11-26 --venue '学生中心' --item-name '健身房' --period 9,13,14
 
 # 监控模式：拉起后每隔1分钟一直反复监测，直到监测目标可预约就发送邮件通知
-python main.py --user '...' --password '...' --date 2026-11-30 --venue '学生中心' --item-name '交谊厅' --period 14,15 --only-moniter --monitor-interval 60 --monitor-repeat --smtp-user ... --smtp-password ... --smtp-host ... --smtp-port ... --mail-to ...
+python main.py --user '...' --password '...' --date 2026-11-30 --venue '学生中心' --item-name '交谊厅' --period 14,15 --only-moniter --monitor-interval 60 --monitor-repeat --smtp-user ... --smtp-password ... --smtp-host ... --smtp-port ... --mail-to ...   # 最好nohop后台运行
 ```
 参考仓库：https://github.com/Chen-WH/SJTU-Sports.git
