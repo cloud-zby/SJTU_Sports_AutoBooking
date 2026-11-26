@@ -18,6 +18,10 @@
 仅监控模式（--only-moniter）：
  登录后按固定间隔只读地查询目标日期/时段是否还有可预约场地，
  一旦可预约就发邮件通知，全程不会选座、不会下单。
+
+多时段（--period）：
+ 支持单个数字、逗号分隔与区间，如 9 / 1,2,3 / 1-5 / 3,7-9；
+ 任一时段有可用场地即触发（正式模式按顺序尝试预约，仅监控模式汇总发邮件）。
 """
 
 import argparse
@@ -93,6 +97,67 @@ TIME_SLOTS = [
     "20:00-21:00",
     "21:00-22:00",
 ]
+
+
+def parse_period_arg(value: str) -> List[int]:
+    """解析 --period，支持单个时段、逗号分隔和区间。
+
+    例：9 / 1,2,3 / 1-5 / 3,7-9。
+    返回去重且保持书写顺序的时段列表，元素范围 1..len(TIME_SLOTS)。
+    """
+    text = str(value or "").strip()
+    if not text:
+        raise argparse.ArgumentTypeError("--period 不能为空")
+
+    periods: List[int] = []
+    for chunk in re.split(r"[,，;；\s]+", text):
+        if not chunk:
+            continue
+        if re.search(r"[-~－]", chunk):
+            bounds = re.split(r"[-~－]", chunk)
+            if len(bounds) != 2 or not all(part.strip().isdigit() for part in bounds):
+                raise argparse.ArgumentTypeError(f"无法解析时段区间: {chunk!r}")
+            start, end = int(bounds[0]), int(bounds[1])
+            if start > end:
+                start, end = end, start
+            chunk_periods = range(start, end + 1)
+        elif chunk.isdigit():
+            chunk_periods = [int(chunk)]
+        else:
+            raise argparse.ArgumentTypeError(f"无法解析时段: {chunk!r}")
+
+        for period in chunk_periods:
+            if period < 1 or period > len(TIME_SLOTS):
+                raise argparse.ArgumentTypeError(
+                    f"时段 {period} 超出范围，必须在 1-{len(TIME_SLOTS)} 之间"
+                )
+            if period not in periods:
+                periods.append(period)
+
+    if not periods:
+        raise argparse.ArgumentTypeError("--period 至少要包含一个时段")
+    return periods
+
+
+def normalize_periods(periods: Any) -> List[int]:
+    """把 int / str / 列表统一成去重后的时段列表（保持顺序）。"""
+    if isinstance(periods, str):
+        return parse_period_arg(periods)
+    values = [periods] if isinstance(periods, int) else list(periods or [])
+
+    result: List[int] = []
+    for value in values:
+        try:
+            period = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"无法解析时段: {value!r}") from exc
+        if period < 1 or period > len(TIME_SLOTS):
+            raise RuntimeError(f"period 必须在 1-{len(TIME_SLOTS)} 之间")
+        if period not in result:
+            result.append(period)
+    if not result:
+        raise RuntimeError("未指定任何时段")
+    return result
 
 
 @dataclass
@@ -1885,7 +1950,7 @@ def book(
     driver: webdriver.Chrome,
     venue: str,
     item_name: str,
-    period: int,
+    periods: Any,
     target_date: Optional[str] = None,
     headless: bool = False,
     verify_timeout: int = 180,
@@ -1896,11 +1961,8 @@ def book(
     if not venue_id:
         raise RuntimeError(f"未知场馆 {venue!r}，请在 TARGET_VENUE_IDS 中补充 venueId")
 
-    row_index = period - 1
-    if row_index < 0 or row_index >= len(TIME_SLOTS):
-        raise RuntimeError(f"period 必须在 1-{len(TIME_SLOTS)} 之间")
-
-    target_slot = TIME_SLOTS[row_index]
+    periods = normalize_periods(periods)
+    target_slots = "、".join(TIME_SLOTS[p - 1] for p in periods)
     url = booking_url(venue_id, item_name)
     print(f"打开预约详情页: {url}")
     driver.get(url)
@@ -1947,79 +2009,98 @@ def book(
     for date_index in date_indices:
         try:
             date_info = select_date(driver, date_index)
-            seats = available_seats(driver, row_index)
         except Exception as exc:
             suffix = "" if single_date else "，切换到前一天"
             print(f"日期索引 {date_index} 加载失败{suffix}: {exc}")
             continue
 
-        if not seats:
-            print(f"{date_info['view']} {target_slot} 无可用场地")
-            grid = describe_seat_grid(driver, row_index)
+        booked = False
+        grid_reported = False
+        for period in periods:
+            row_index = period - 1
+            target_slot = TIME_SLOTS[row_index]
+            try:
+                seats = available_seats(driver, row_index)
+            except Exception as exc:
+                print(f"{date_info['view']} {target_slot} 读取场地失败: {exc}")
+                continue
+
+            if not seats:
+                print(f"{date_info['view']} {target_slot} 无可用场地")
+                if not grid_reported:
+                    grid_reported = True
+                    grid = describe_seat_grid(driver, row_index)
+                    print(
+                        f"[诊断] 项目={grid.get('activeType')} 场地数={grid.get('fieldCount')} "
+                        f"seatArray={grid.get('outerCount')}x{grid.get('innerCount')} "
+                        f"紧张度={grid.get('nerData')} 状态分布={grid.get('statuses')}"
+                    )
+                    print(
+                        f"[诊断] 日期={grid.get('timeData')} 场地={grid.get('fields')} "
+                        f"目标行({target_slot})状态={grid.get('rowStatus')}"
+                    )
+                continue
+
+            seat = seats[0]
             print(
-                f"[诊断] 项目={grid.get('activeType')} 场地数={grid.get('fieldCount')} "
-                f"seatArray={grid.get('outerCount')}x{grid.get('innerCount')} "
-                f"紧张度={grid.get('nerData')} 状态分布={grid.get('statuses')}"
+                f"{date_info['view']} {target_slot} 找到 {len(seats)} 个可用场地，"
+                f"尝试 {seat.get('fieldName')}"
             )
-            print(
-                f"[诊断] 日期={grid.get('timeData')} 场地={grid.get('fields')} "
-                f"目标行({target_slot})状态={grid.get('rowStatus')}"
-            )
+
+            try:
+                buy_lists = choose_seat(driver, seat)
+                print(
+                    "已选择: "
+                    + ", ".join(
+                        f"{x.get('subSitename')} {x.get('scheduleTime')}"
+                        for x in buy_lists
+                    )
+                )
+                result = submit_order(
+                    driver,
+                    headless=headless,
+                    verify_timeout=verify_timeout,
+                    auto_verify=auto_verify,
+                    save_dir=save_dir,
+                )
+                print(f"提交结果: {result.status} {result.message}")
+                if result.status == "success":
+                    success_count += 1
+                    booked = True
+                    print(f"{date_info['view']} {target_slot} 预约成功")
+                    break
+                if result.status == "captcha":
+                    print(f"人机验证未通过，结束本轮遍历：{result.message}")
+                    return success_count > 0
+                print(f"{date_info['view']} {target_slot} 提交未成功，尝试下一个时段")
+            except Exception as exc:
+                print(
+                    f"{date_info['view']} {target_slot} 场地 "
+                    f"{seat.get('fieldName')} 尝试失败: {exc}"
+                )
+            finally:
+                reset_selection(driver)
+
+        if booked:
+            if single_date:
+                break
+            print(f"{date_info['view']} 预约成功，继续遍历前一天")
+            driver.get(url)
+            wait_for_details_ready(driver)
+            select_motion_type(driver, item_name, venue=venue)
             continue
 
-        seat = seats[0]
-        print(
-            f"{date_info['view']} {target_slot} 找到 {len(seats)} 个可用场地，"
-            f"尝试 {seat.get('fieldName')}"
-        )
-
-        try:
-            buy_lists = choose_seat(driver, seat)
-            print(
-                "已选择: "
-                + ", ".join(
-                    f"{x.get('subSitename')} {x.get('scheduleTime')}" for x in buy_lists
-                )
-            )
-            result = submit_order(
-                driver,
-                headless=headless,
-                verify_timeout=verify_timeout,
-                auto_verify=auto_verify,
-                save_dir=save_dir,
-            )
-            print(f"提交结果: {result.status} {result.message}")
-            if result.status == "success":
-                success_count += 1
-                if single_date:
-                    print(f"{date_info['view']} 预约成功")
-                    break
-                print(f"{date_info['view']} 预约成功，继续遍历前一天")
-                driver.get(url)
-                wait_for_details_ready(driver)
-                select_motion_type(driver, item_name, venue=venue)
-                continue
-            if result.status == "captcha":
-                print(f"人机验证未通过，结束本轮遍历：{result.message}")
-                return success_count > 0
-            suffix = "" if single_date else "，切换到前一天"
-            print(f"{date_info['view']} 提交未成功{suffix}")
-        except Exception as exc:
-            suffix = "" if single_date else "，切换到前一天"
-            print(
-                f"{date_info['view']} 场地 {seat.get('fieldName')} 尝试失败{suffix}: {exc}"
-            )
-        finally:
-            reset_selection(driver)
+        if not single_date:
+            print(f"{date_info['view']} 目标时段均未预约成功，切换到前一天")
 
     if success_count:
         print(f"本轮完成，成功预约 {success_count} 天")
         return True
 
     if single_date:
-        print(f"指定日期 {target_date} 的 {target_slot} 未预约成功")
+        print(f"指定日期 {target_date} 的 {target_slots} 未预约成功")
     else:
-        print(f"本轮遍历完成，没有成功预约任一天 {target_slot}")
+        print(f"本轮遍历完成，没有成功预约任一天 {target_slots}")
     return False
 
 
@@ -2030,24 +2111,23 @@ def query_slot_availability(
     driver: webdriver.Chrome,
     venue: str,
     item_name: str,
-    period: int,
+    periods: Any,
     target_date: str,
 ) -> Dict[str, Any]:
-    """只读地查询指定日期/时段是否还有可预约场地（不选座、不下单）。
+    """只读地查询指定日期下多个时段是否还有可预约场地（不选座、不下单）。
 
     返回 status：
-      - available        有可预约场地
-      - full             该时段已约满/无可用场地
+      - available        至少一个目标时段有可预约场地
+      - full             目标时段都已约满/无可用场地
       - date-unavailable 目标日期还没放开或已过期
+
+    slots 为逐个时段的检查结果；available 只保留有可预约场地的时段。
     """
     venue_id = TARGET_VENUE_IDS.get(venue)
     if not venue_id:
         raise RuntimeError(f"未知场馆 {venue!r}，请在 TARGET_VENUE_IDS 中补充 venueId")
 
-    row_index = period - 1
-    if row_index < 0 or row_index >= len(TIME_SLOTS):
-        raise RuntimeError(f"period 必须在 1-{len(TIME_SLOTS)} 之间")
-    target_slot = TIME_SLOTS[row_index]
+    period_list = normalize_periods(periods)
 
     target_ymd = extract_date_parts(target_date)
     if not target_ymd:
@@ -2065,40 +2145,50 @@ def query_slot_availability(
     if match_index is None:
         return {
             "status": "date-unavailable",
-            "slot": target_slot,
+            "slots": [TIME_SLOTS[p - 1] for p in period_list],
             "available_dates": [
                 f"{item.get('view')}({item.get('date')})" for item in week_list
             ],
         }
 
     date_info = select_date(driver, match_index)
-    seats = available_seats(driver, row_index)
-    result: Dict[str, Any] = {
-        "status": "available" if seats else "full",
-        "slot": target_slot,
+    entries: List[Dict[str, Any]] = []
+    for period in period_list:
+        row_index = period - 1
+        seats = available_seats(driver, row_index)
+        entry: Dict[str, Any] = {
+            "period": period,
+            "slot": TIME_SLOTS[row_index],
+            "status": "available" if seats else "full",
+            "seats": seats,
+        }
+        if not seats:
+            entry["grid"] = describe_seat_grid(driver, row_index)
+        entries.append(entry)
+
+    available = [entry for entry in entries if entry["status"] == "available"]
+    return {
+        "status": "available" if available else "full",
         "date": date_info,
-        "seats": seats,
+        "slots": entries,
+        "available": available,
     }
-    if not seats:
-        result["grid"] = describe_seat_grid(driver, row_index)
-    return result
 
 
 def build_monitor_mail(
     venue: str,
     item_name: str,
     target_date: str,
-    row_index: int,
-    seats: List[Dict[str, Any]],
+    slots: List[Dict[str, Any]],
     date_info: Optional[Dict[str, Any]],
 ) -> tuple:
-    """拼出通知邮件的标题与正文。"""
-    slot = TIME_SLOTS[row_index]
+    """拼出通知邮件的标题与正文（slots 为有可预约场地的时段条目）。"""
     view = (date_info or {}).get("view") or ""
-    names = [
-        str(seat.get("fieldName") or f"场地{i + 1}") for i, seat in enumerate(seats)
-    ]
-    subject = f"[SJTU场馆] {venue} {item_name} {target_date} {slot} 有可预约场地"
+    slot_names = [str(entry.get("slot") or "") for entry in slots] or ["（未知时段）"]
+    subject = (
+        f"[SJTU场馆] {venue} {item_name} {target_date} "
+        f"{'、'.join(slot_names)} 有可预约场地"
+    )
 
     venue_id = TARGET_VENUE_IDS.get(venue)
     link = booking_url(venue_id, item_name) if venue_id else BASE_URL
@@ -2108,15 +2198,28 @@ def build_monitor_mail(
         f"场馆：{venue}",
         f"项目：{item_name}",
         f"日期：{target_date}{f'（{view}）' if view else ''}",
-        f"时段：{slot}",
-        f"可预约场地：{', '.join(names) if names else '（未识别）'}",
-        f"检查时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
-        "",
-        "预约详情页：",
-        link,
-        "",
-        "说明：本条为只读监控通知，脚本没有替你下单，请尽快自行预约。",
+        f"时段：{'、'.join(slot_names)}",
     ]
+    for entry in slots:
+        seats = entry.get("seats") or []
+        names = [
+            str(seat.get("fieldName") or f"场地{i + 1}")
+            for i, seat in enumerate(seats)
+        ]
+        body_lines.append(
+            f"可预约场地（{entry.get('slot')}）："
+            f"{', '.join(names) if names else '（未识别）'}"
+        )
+    body_lines.extend(
+        [
+            f"检查时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+            "",
+            "预约详情页：",
+            link,
+            "",
+            "说明：本条为只读监控通知，脚本没有替你下单，请尽快自行预约。",
+        ]
+    )
     return subject, "\n".join(body_lines)
 
 
@@ -2203,18 +2306,19 @@ def run_monitor(args: argparse.Namespace) -> int:
         print(f"[监控] 未知场馆 {args.venue!r}")
         return 2
 
-    row_index = args.period - 1
-    if row_index < 0 or row_index >= len(TIME_SLOTS):
-        print(f"[监控] --period 必须在 1-{len(TIME_SLOTS)} 之间")
+    try:
+        periods = normalize_periods(args.period)
+    except RuntimeError as exc:
+        print(f"[监控] {exc}")
         return 2
 
-    target_slot = TIME_SLOTS[row_index]
+    target_slots = "、".join(TIME_SLOTS[p - 1] for p in periods)
     interval = max(10, int(args.monitor_interval))
     mail_ready = bool(args.smtp_user and args.smtp_password)
 
     print("=" * 64)
     print("[监控] 仅监控模式：只读检查，不会选座、不会下单")
-    print(f"[监控] 目标：{args.venue} / {args.item_name} / {args.date} {target_slot}")
+    print(f"[监控] 目标：{args.venue} / {args.item_name} / {args.date} {target_slots}")
     print(f"[监控] 频率：每 {interval} 秒检查一次")
     if mail_ready:
         print(f"[监控] 可约时邮件通知 -> {args.mail_to}")
@@ -2248,7 +2352,7 @@ def run_monitor(args: argparse.Namespace) -> int:
             result: Dict[str, Any] = {"status": "error"}
             try:
                 result = query_slot_availability(
-                    driver, args.venue, args.item_name, args.period, args.date
+                    driver, args.venue, args.item_name, periods, args.date
                 )
                 failures = 0
             except Exception as exc:
@@ -2260,21 +2364,22 @@ def run_monitor(args: argparse.Namespace) -> int:
 
             status = result.get("status")
             if status == "available":
-                seats = result.get("seats") or []
-                names = [
-                    str(seat.get("fieldName") or f"场地{i + 1}")
-                    for i, seat in enumerate(seats)
-                ]
-                print(
-                    f"[监控 {stamp:%H:%M:%S}] ★ 发现可预约场地！"
-                    f"{args.date} {target_slot} -> {', '.join(names)}"
-                )
+                available = result.get("available") or []
+                for entry in available:
+                    seats = entry.get("seats") or []
+                    names = [
+                        str(seat.get("fieldName") or f"场地{i + 1}")
+                        for i, seat in enumerate(seats)
+                    ]
+                    print(
+                        f"[监控 {stamp:%H:%M:%S}] ★ 发现可预约场地！"
+                        f"{args.date} {entry.get('slot')} -> {', '.join(names)}"
+                    )
                 subject, body = build_monitor_mail(
                     args.venue,
                     args.item_name,
                     args.date,
-                    row_index,
-                    seats,
+                    available,
                     result.get("date"),
                 )
                 print("-" * 64)
@@ -2286,11 +2391,15 @@ def run_monitor(args: argparse.Namespace) -> int:
                     print("[监控] 已完成通知，退出监控")
                     break
             elif status == "full":
-                grid = result.get("grid") or {}
+                slots = result.get("slots") or []
+                details = "；".join(
+                    f"{entry.get('slot')} 场地数={(entry.get('grid') or {}).get('fieldCount')} "
+                    f"状态分布={(entry.get('grid') or {}).get('statuses')}"
+                    for entry in slots
+                )
                 print(
-                    f"[监控 {stamp:%H:%M:%S}] 暂不可约：{args.date} {target_slot}"
-                    f"（场地数={grid.get('fieldCount')} "
-                    f"状态分布={grid.get('statuses')}）"
+                    f"[监控 {stamp:%H:%M:%S}] 暂不可约：{args.date} {target_slots}"
+                    f"（{details or '无数据'}）"
                 )
             elif status == "date-unavailable":
                 dates = "；".join(result.get("available_dates") or []) or "（无）"
@@ -2364,7 +2473,7 @@ def run_attempt(args: argparse.Namespace) -> bool:
             driver,
             venue=args.venue,
             item_name=args.item_name,
-            period=args.period,
+            periods=args.period,
             target_date=args.date,
             headless=args.headless,
             verify_timeout=args.verify_timeout,
@@ -2462,9 +2571,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--period",
-        type=int,
-        default=9,
-        help="预约时间段，7:00-8:00 算 1，15:00-16:00 算 9",
+        type=parse_period_arg,
+        default=[9],
+        help=(
+            "预约时间段，7:00-8:00 算 1，15:00-16:00 算 9；"
+            "支持序列，如 1,2,3 或 1-5（默认 9）。任一时段可预约即预约/通知"
+        ),
     )
     parser.add_argument(
         "--date",
