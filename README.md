@@ -13,7 +13,7 @@ pip install selenium pillow pytesseract opencv-python numpy
 ```
 自动预约（自动尝试至多5次OCR识别与AJ-Captcha-blockPuzzle与AJ-Captcha-clickWord）
 ```bash
-# 立刻预约
+# 立刻预约（需要替换为自己的JAccount账户名和密码）
 python main.py --user '...' --password '...' --date 2026-11-30 --venue '学生中心' --item-name '交谊厅' --period 14 --test
 
 # 正式模式：默认在每日 12:00-12:10 窗口内反复尝试
